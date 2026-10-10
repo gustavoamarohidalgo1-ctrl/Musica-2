@@ -34,11 +34,17 @@ STEMS = {
     "other":  {"label": "Otros",          "color": "#a78bfa", "program": 48},
     "drums":  {"label": "Batería",        "color": "#8b8d98", "program": 0},
     "mix":    {"label": "Audio completo", "color": "#4f8cff", "program": 0},
+    # Modo «Teclado con Style»
+    "voice":  {"label": "Voice (mano derecha)", "color": "#ffb224", "program": 0},
+    "acomp":  {"label": "Acordes y pads",       "color": "#7c8cff", "program": 48},
+    "canto":  {"label": "Voz humana (canto o habla)", "color": "#30a46c", "program": 52},
 }
 # La batería no tiene notas afinadas: se separa pero no se transcribe.
 NO_TRANSCRIBE = {"drums"}
 # Una pista con menos energía que este % de la pista más fuerte se considera vacía.
 EMPTY_RATIO = 0.06
+# Duración mínima (s) de un recorte.
+MIN_CLIP = 1.0
 
 _models: dict = {}
 _models_lock = threading.Lock()
@@ -101,6 +107,18 @@ def _duration(path: Path) -> float:
         capture_output=True, text=True, check=True,
     )
     return float(out.stdout.strip())
+
+
+def _cut(src: Path, dst: Path, start: float, end: float | None) -> None:
+    """Recorta src entre start y end (segundos; end=None = hasta el final) a WAV."""
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{start:.3f}", "-i", str(src)]
+    if end is not None:
+        cmd += ["-t", f"{end - start:.3f}"]
+    subprocess.run(cmd + ["-vn", "-ac", "2", "-ar", "44100", str(dst)], check=True)
+
+
+def _clock(s: float) -> str:
+    return f"{int(s // 60)}:{int(s % 60):02d}"
 
 
 def separate(input_path: Path, out_dir: Path, on_progress) -> dict[str, Path]:
@@ -186,20 +204,54 @@ def write_midi(tracks: list[dict], path: Path) -> None:
 # Trabajo completo
 # --------------------------------------------------------------------------- #
 
-def run_job(job_dir: Path, input_path: Path, mode: str, piano_hq: bool, update) -> dict:
-    """mode: 'separar' | 'piano' | 'instrumento'.  update(step, progress)."""
+def run_job(job_dir: Path, input_path: Path, mode: str, piano_hq: bool, update,
+            clip: dict | None = None) -> dict:
+    """mode: 'separar' | 'piano' | 'instrumento'.  update(step, progress).
+
+    clip: {"start": s, "end": e | None} para procesar solo ese tramo. Los tiempos del
+    resultado (notas, MIDI, audios) empiezan en 0 al inicio del tramo.
+    """
+    clip_wav = job_dir / "clip.wav"
+    try:
+        return _run_job(job_dir, input_path, mode, piano_hq, update, clip, clip_wav)
+    finally:
+        clip_wav.unlink(missing_ok=True)
+
+
+def _run_job(job_dir, input_path, mode, piano_hq, update, clip, clip_wav) -> dict:
     use_bytedance = piano_hq and bytedance_available()
 
+    source = input_path
+    if clip:
+        update("Recortando audio…", 0.01)
+        _cut(input_path, clip_wav, clip["start"], clip.get("end"))
+        try:
+            clip_len = _duration(clip_wav)
+        except ValueError:  # ffprobe da "N/A" para un WAV vacío
+            clip_len = 0.0
+        if clip_len < 0.05:
+            raise ValueError(
+                f"El recorte quedó vacío: el inicio ({_clock(clip['start'])}) está después "
+                "del final de la canción.")
+        if clip_len < MIN_CLIP:
+            raise ValueError(
+                f"El tramo elegido dura solo {clip_len:.1f} s porque la canción termina ahí; "
+                f"el mínimo es {MIN_CLIP:g} s.")
+        source = clip_wav
+
     update("Preparando audio…", 0.02)
-    _to_mp3(input_path, job_dir / "original.mp3")
+    _to_mp3(source, job_dir / "original.mp3")
     duration = _duration(job_dir / "original.mp3")
+
+    if mode == "teclado":
+        return _run_teclado(job_dir, source, duration, update)
 
     if mode == "separar":
         update("Separando instrumentos (Demucs)…", 0.05)
-        stems = separate(input_path, job_dir, lambda p: update(None, 0.05 + 0.45 * p))
+        stems = separate(source, job_dir, lambda p: update(None, 0.05 + 0.45 * p))
     else:
         wav = job_dir / "mix.wav"
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(input_path),
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(source),
                         "-ac", "2", "-ar", "44100", str(wav)], check=True)
         stems = {"mix": wav}
 
@@ -259,6 +311,110 @@ def run_job(job_dir: Path, input_path: Path, mode: str, piano_hq: bool, update) 
         "duration": duration,
         "tracks": tracks,
         "skipped": skipped,
+        "combined_midi": "todo.mid" if with_notes else None,
+    }
+
+
+def _run_teclado(job_dir: Path, source: Path, duration: float, update) -> dict:
+    """Canto / Voice (mano derecha) / Style (acompañamiento) de una grabación de teclado."""
+    # Demucs lee cualquier formato con ffmpeg, pero soundfile no (m4a, mp4, aac, webm): se usa un WAV.
+    wav = job_dir / "teclado_src.wav"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(source),
+                    "-vn", "-ac", "2", "-ar", "44100", str(wav)], check=True)
+    stems: dict[str, Path] = {}
+    try:
+        return _teclado_tracks(job_dir, wav, duration, update, stems)
+    finally:  # también si falla: las pistas WAV de Demucs ocupan cientos de MB
+        wav.unlink(missing_ok=True)
+        for p in stems.values():
+            p.unlink(missing_ok=True)
+
+
+def _teclado_tracks(job_dir: Path, source: Path, duration: float, update, stems: dict) -> dict:
+    from . import teclado
+
+    update("Separando instrumentos (Demucs)…", 0.05)
+    stems.update(separate(source, job_dir, lambda p: update(None, 0.05 + 0.40 * p)))
+    update("Buscando la Voice y el Style…", 0.45)
+    res = teclado.analyze(source, stems, job_dir / "_teclado", lambda p: update(None, 0.45 + 0.45 * p))
+
+    def clean(notes):
+        out = []
+        for n in notes:
+            c = {"start": float(n["start"]), "end": min(float(n["end"]), duration),
+                 "pitch": int(n["pitch"]), "velocity": int(np.clip(n["velocity"], 1, 127))}
+            if "p" in n:  # probabilidad de ser Voice: la usa el control «Separación Voice ↔ Style»
+                c["p"] = round(float(n["p"]), 3)
+            if c["end"] > c["start"]:
+                out.append(c)
+        return sorted(out, key=lambda n: (n["start"], n["pitch"]))
+
+    # El Style que no es el bajo: acordes, pads y frases.
+    bass = clean(res["bass"])
+    by_pitch: dict[int, list[float]] = {}
+    for n in bass:
+        by_pitch.setdefault(n["pitch"], []).append(n["start"])
+    acomp = [n for n in clean(res["style"])
+             if not any(abs(s - n["start"]) <= 0.05 for s in by_pitch.get(n["pitch"], []))]
+
+    update("Guardando pistas…", 0.92)
+    audio = {}
+    for name in ("bass", "drums", "vocals"):
+        audio[name] = f"{name}.mp3"
+        _to_mp3(stems[name], job_dir / audio[name])
+
+    # Mezclas para escuchar: sin batería ni bajo, y sin canto.
+    mixes = []
+    wav = {k: sf.read(str(p), dtype="float32", always_2d=True)[0] for k, p in stems.items()}
+    n = min(len(v) for v in wav.values())
+    harm_parts = ["piano", "guitar", "other"] + ([] if res["singer"] else ["vocals"])
+    for name, label, parts in (
+        ("sin_bateria_bajo", "Sin batería ni bajo", harm_parts),
+        ("sin_canto", "Sin voz humana", ["piano", "guitar", "bass", "other", "drums"]),
+    ):
+        if name == "sin_canto" and not res["singer"]:
+            continue
+        tmp = job_dir / f"{name}.wav"
+        mixed = sum(wav[k][:n] for k in parts)
+        sf.write(tmp, np.clip(mixed, -1, 1), 44100)
+        _to_mp3(tmp, job_dir / f"{name}.mp3")
+        tmp.unlink(missing_ok=True)
+        mixes.append({"file": f"{name}.mp3", "label": label})
+    for p in stems.values():
+        p.unlink(missing_ok=True)
+
+    def track(tid, group, notes, audio_file=None, transcribed=True, engine="Basic Pitch"):
+        meta = STEMS[tid]
+        t = {"id": tid, "group": group, "label": meta["label"], "color": meta["color"],
+             "program": meta["program"], "engine": engine if transcribed else None,
+             "audio": audio_file, "notes": notes, "transcribed": transcribed}
+        if notes:
+            t["midi"] = f"{tid}.mid"
+            write_midi([t], job_dir / t["midi"])
+        return t
+
+    tracks = [
+        track("voice", "voice", clean(res["voice"]), engine="Basic Pitch + separación Voice/Style"),
+        track("bass", "style", bass, audio["bass"]),
+        track("acomp", "style", acomp, engine="Basic Pitch + separación Voice/Style"),
+        track("drums", "style", [], audio["drums"], transcribed=False),
+    ]
+    if res["singer"]:
+        tracks.append(track("canto", "canto", clean(res["canto"]), audio["vocals"]))
+    else:
+        (job_dir / audio["vocals"]).unlink(missing_ok=True)
+
+    with_notes = [t for t in tracks if t["notes"]]
+    if with_notes:
+        write_midi(with_notes, job_dir / "todo.mid")
+    update("Listo", 1.0)
+    return {
+        "duration": duration,
+        "tracks": tracks,
+        "skipped": [],
+        "mixes": mixes,
+        "singer": res["singer"],
+        "voice_thr": teclado.voice_style.threshold(),
         "combined_midi": "todo.mid" if with_notes else None,
     }
 

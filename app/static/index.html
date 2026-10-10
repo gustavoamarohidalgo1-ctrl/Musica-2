@@ -30,10 +30,31 @@
             <small>MP3, WAV, M4A, FLAC, OGG…</small>
           </label>
 
+          <div id="trim" class="trim" hidden>
+            <div class="trim-head">
+              <span>Recortar <small class="muted">(opcional)</small></span>
+              <button id="trim-reset" class="btn small" type="button">Toda la canción</button>
+            </div>
+            <div class="wave-wrap">
+              <canvas id="wave" aria-label="Forma de onda: arrastra para elegir el tramo"></canvas>
+              <span id="wave-msg" class="wave-msg"></span>
+            </div>
+            <div class="trim-fields">
+              <label>Desde <input id="trim-start" type="text" inputmode="decimal" placeholder="0:00" autocomplete="off"></label>
+              <label>Hasta <input id="trim-end" type="text" inputmode="decimal" placeholder="final" autocomplete="off"></label>
+              <button id="trim-play" class="btn small" type="button" disabled>▶ Escuchar</button>
+            </div>
+            <small id="trim-info" class="trim-info"></small>
+          </div>
+
           <fieldset class="modes">
             <legend>¿Qué tipo de audio es?</legend>
             <label class="mode">
-              <input type="radio" name="mode" value="separar" checked>
+              <input type="radio" name="mode" value="teclado" checked>
+              <span><b>Teclado con Style</b><small>Separa lo que toca la mano derecha (Voice) del acompañamiento automático (Style)</small></span>
+            </label>
+            <label class="mode">
+              <input type="radio" name="mode" value="separar">
               <span><b>Canción completa</b><small>Separa piano, guitarra, bajo, voz… y saca las notas de cada uno</small></span>
             </label>
             <label class="mode">
@@ -85,6 +106,30 @@
           <button id="dl-all" class="btn primary">⬇ Descargar MIDI (todo)</button>
         </div>
 
+        <div id="group-view" class="group-view" role="group" aria-label="Qué notas ver" hidden>
+          <span>Ver</span>
+          <button type="button" data-group="all">Todo</button>
+          <button type="button" data-group="voice">Solo Voice</button>
+          <button type="button" data-group="style">Solo Style</button>
+          <button type="button" data-group="canto">Solo voz humana</button>
+          <label id="keys-box" class="check small keys" hidden
+                 title="Con Harmony o Dual el teclado suena notas que no tocaste: se pasan a «Harmony y Dual (automático)».">
+            <input id="only-keys" type="checkbox" checked> Solo teclas presionadas (sin Harmony ni Dual)
+          </label>
+          <span id="oct-box" class="oct" hidden
+                title="Si tu Dual suena una octava arriba, la Voice puede salir una octava alta: bájala aquí.">
+            Octava de la Voice
+            <button id="oct-down" type="button" aria-label="Bajar la Voice una octava">▼</button>
+            <span id="oct-val">0</span>
+            <button id="oct-up" type="button" aria-label="Subir la Voice una octava">▲</button>
+          </span>
+          <label id="split-box" class="split" hidden
+                 title="Mueve notas dudosas entre la Voice y el Style. Escucha con «Sonido MIDI» para ajustarlo.">
+            Separación: más Style
+            <input id="split" type="range" min="0.05" max="0.95" step="0.01">
+            más Voice
+          </label>
+        </div>
         <div id="tracks" class="tracks"></div>
 
         <div class="transport card">
@@ -129,6 +174,7 @@
     </main>
   </div>
 
+  <script src="teclas.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
